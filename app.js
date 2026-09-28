@@ -112,9 +112,11 @@ function resolveSV(v) {
 }
 
 const db = REMOTE ? {
+  // POST с x-http-method-override — «простой» запрос без предварительного CORS-запроса,
+  // а keepalive не даёт браузеру оборвать его при обновлении или закрытии страницы.
   async write(method, path, data) {
-    const res = await fetch(`${CFG.DB_URL}/${path}.json`, {
-      method, body: data === undefined ? undefined : JSON.stringify(data)
+    const res = await fetch(`${CFG.DB_URL}/${path}.json?x-http-method-override=${method}`, {
+      method: 'POST', keepalive: true, body: data === undefined ? '' : JSON.stringify(data)
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   },
@@ -216,6 +218,12 @@ function loadView() { try { return JSON.parse(sessionStorage.getItem(SS_VIEW)) |
 function teacherAuthed() { try { return sessionStorage.getItem('algebra_teacher') === CFG.TEACHER_HASH; } catch { return false; } }
 
 function restore() {
+  route();
+  const p = session || lsGet(LS_SESSION);
+  if (p && needsSync(p)) sync(p);
+}
+
+function route() {
   const v = loadView();
   const s = lsGet(LS_SESSION);
   if ((v.v === 'test' || v.v === 'result') && s) {
@@ -292,13 +300,10 @@ async function startStudent() {
   }
   session = {
     sid: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
-    name, qs, answers: {}, current: 0, finished: false, startedLocal: Date.now()
+    name, qs, answers: {}, current: 0, finished: false, startedLocal: Date.now(), rev: 1, syncedRev: 0
   };
   lsSet(LS_SESSION, session);
-  db.put(`${PATH}/${session.sid}`, {
-    name, qs, answers: {}, current: 0, score: 0, answered: 0, total: qs.length,
-    startedAt: SV, updatedAt: SV, finishedAt: null
-  }).then(() => setSync('ok'), () => { setSync('error'); scheduleSync(); });
+  sync();
   startHeartbeat();
   renderTest();
 }
@@ -307,7 +312,7 @@ function resumeStudent() {
   session = lsGet(LS_SESSION);
   if (!session) return renderHome();
   startHeartbeat();
-  sync();
+  if (needsSync(session)) sync();
   renderTest();
 }
 
@@ -320,28 +325,52 @@ function setSync(state) {
   }
 }
 
-async function sync() {
-  if (!session) return;
+// Каждое изменение увеличивает rev; syncedRev — последняя версия, подтверждённая базой.
+// Если запрос не дошёл (нет сети, страницу обновили), при следующем открытии отправим снова.
+// Обычные изменения идут по очереди (чтобы старый снимок не перезаписал новый),
+// а сдача теста и уход со страницы отправляются сразу (urgent), не дожидаясь очереди.
+let inflight = 0, syncAgain = false;
+const needsSync = s => !s.created || (s.rev || 0) > (s.syncedRev || 0) || (s.finished && !s.finishedSent);
+function bump(s) { s.rev = (s.rev || 0) + 1; lsSet(LS_SESSION, s); }
+function persist(s) {
+  const cur = lsGet(LS_SESSION);
+  if (s === session || (cur && cur.sid === s.sid)) lsSet(LS_SESSION, s);
+}
+
+async function sync(s = session, urgent = false) {
+  if (!s) return;
+  if (inflight) {
+    syncAgain = true;          // после завершения текущих запросов дошлём самое свежее состояние
+    if (!urgent) return;
+  }
   clearTimeout(syncTimer);
-  const s = session;
+  inflight++;
+  const rev = s.rev || 0;
+  const finishing = s.finished && !s.finishedSent;
   const data = {
+    name: s.name, qs: s.qs, total: s.qs.length,
     answers: s.answers, current: s.current, score: scoreOf(s), answered: answeredCount(s),
     updatedAt: SV
   };
-  if (s.finished && !s.finishedSent) data.finishedAt = SV;
-  // если стартовая запись не дошла — дошлём всё целиком
-  data.name = s.name; data.qs = s.qs; data.total = s.qs.length;
+  if (!s.created) data.startedAt = s.createTried ? s.startedLocal : SV;
+  if (finishing) data.finishedAt = SV;
+  s.createTried = true;
   setSync('saving');
+  let ok = true;
   try {
     await db.patch(`${PATH}/${s.sid}`, data);
-    if (s.finished) { s.finishedSent = true; lsSet(LS_SESSION, s); }
-    setSync('ok');
-  } catch {
-    setSync('error');
-    scheduleSync();
-  }
+    s.created = true;
+    s.syncedRev = Math.max(s.syncedRev || 0, rev);
+    if (finishing) s.finishedSent = true;
+    persist(s);
+  } catch { ok = false; }
+  inflight--;
+  if (!ok) { setSync('error'); scheduleSync(s); return; }
+  if (inflight) return;
+  if (syncAgain || needsSync(s)) { syncAgain = false; return sync(s); }
+  setSync('ok');
 }
-function scheduleSync() { clearTimeout(syncTimer); syncTimer = setTimeout(sync, 5000); }
+function scheduleSync(s = session) { clearTimeout(syncTimer); syncTimer = setTimeout(() => sync(s), 5000); }
 
 function startHeartbeat() {
   stopHeartbeat();
@@ -448,14 +477,14 @@ function answer(k) {
   const item = s.qs[i];
   const orig = item.o[k];
   s.answers[i] = { c: orig, ok: orig === BY_ID[item.id].a };
-  lsSet(LS_SESSION, s);
+  bump(s);
   sync();
   renderTest();
 }
 
 function goTo(i) {
   session.current = Math.max(0, Math.min(session.qs.length - 1, i));
-  lsSet(LS_SESSION, session);
+  bump(session);
   sync();
   renderTest();
   app.querySelector('.task').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -468,9 +497,9 @@ function finish() {
   if (left === 0 && !confirm('Завершить тест и отправить результат учителю?')) return;
   s.finished = true;
   s.finishedLocal = Date.now();
-  lsSet(LS_SESSION, s);
+  bump(s);
   stopHeartbeat();
-  sync();
+  sync(s, true);
   renderResult();
 }
 
@@ -684,6 +713,9 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowRight') goTo(session.current + 1);
   if (e.key === 'ArrowLeft') goTo(session.current - 1);
 });
+
+// Уход со страницы (обновление, закрытие вкладки): неотправленное — сразу, keepalive доставит
+window.addEventListener('pagehide', () => { if (session && needsSync(session)) sync(session, true); });
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && session && !session.finished && app.classList.contains('test')) sync();
