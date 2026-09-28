@@ -702,6 +702,7 @@ app.addEventListener('click', async e => {
       const r = teacher.tree[teacher.sid];
       if (!r || !confirm(`Удалить работу «${r.name}»? Её нельзя будет восстановить.`)) return;
       try { await db.del(`${PATH}/${teacher.sid}`); } catch { alert('Не удалось удалить: нет связи с базой.'); return; }
+      delete teacher.tree[teacher.sid];   // убираем сразу, не дожидаясь уведомления от базы
       teacher.view = 'list';
       return renderTeacherBody();
     }
