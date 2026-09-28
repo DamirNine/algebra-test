@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Проверочная по алгебре</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=PT+Serif:ital,wght@0,400;0,700;1,400&family=Caveat:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="app" class="sheet"></main>
+
+<div id="modal" class="modal" hidden>
+  <form class="modal-card" id="modal-form" autocomplete="off">
+    <h2 id="modal-title"></h2>
+    <p id="modal-text" class="muted"></p>
+    <input id="modal-input">
+    <p id="modal-error" class="form-error" hidden></p>
+    <div class="modal-actions">
+      <button type="button" class="btn ghost" id="modal-cancel">Отмена</button>
+      <button type="submit" class="btn" id="modal-ok"></button>
+    </div>
+  </form>
+</div>
+
+<script src="config.js"></script>
+<script src="questions.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
