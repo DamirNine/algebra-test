@@ -86,6 +86,7 @@ async function sha256(text) {
 // ───────── хранилище: Firebase REST или локальный режим ─────────
 const SV = { '.sv': 'timestamp' };
 const REMOTE = !!CFG.DB_URL;
+const PATH = CFG.DB_PATH || 'results';
 
 function setAt(root, path, value) {
   const parts = path.split('/').filter(Boolean);
@@ -206,10 +207,35 @@ const modal = {
   }
 };
 
+// ───────── запоминание экрана (чтобы при обновлении страницы не выкидывало в начало) ─────────
+// sessionStorage живёт, пока открыта вкладка: обновление страницы возвращает на тот же экран,
+// а новая вкладка открывает главную (следующий ученик за тем же компьютером не попадёт в чужой тест).
+const SS_VIEW = 'algebra_view';
+function saveView(v) { try { sessionStorage.setItem(SS_VIEW, JSON.stringify(v)); } catch { /* ignore */ } }
+function loadView() { try { return JSON.parse(sessionStorage.getItem(SS_VIEW)) || {}; } catch { return {}; } }
+function teacherAuthed() { try { return sessionStorage.getItem('algebra_teacher') === CFG.TEACHER_HASH; } catch { return false; } }
+
+function restore() {
+  const v = loadView();
+  const s = lsGet(LS_SESSION);
+  if ((v.v === 'test' || v.v === 'result') && s) {
+    if (!s.finished) return resumeStudent();
+    session = s;
+    return renderResult();
+  }
+  if (v.v === 'teacher' && teacherAuthed()) {
+    teacher.filter = v.filter || 'all';
+    teacher.query = v.query || '';
+    return openTeacher({ view: v.tv, sid: v.sid });
+  }
+  renderHome();
+}
+
 // ───────── главный экран ─────────
 function renderHome() {
   stopTeacher();
   stopHeartbeat();
+  saveView({ v: 'home' });
   const s = lsGet(LS_SESSION);
   const resume = s && !s.finished ? s : null;
   app.className = 'sheet home';
@@ -269,7 +295,7 @@ async function startStudent() {
     name, qs, answers: {}, current: 0, finished: false, startedLocal: Date.now()
   };
   lsSet(LS_SESSION, session);
-  db.put(`results/${session.sid}`, {
+  db.put(`${PATH}/${session.sid}`, {
     name, qs, answers: {}, current: 0, score: 0, answered: 0, total: qs.length,
     startedAt: SV, updatedAt: SV, finishedAt: null
   }).then(() => setSync('ok'), () => { setSync('error'); scheduleSync(); });
@@ -307,7 +333,7 @@ async function sync() {
   data.name = s.name; data.qs = s.qs; data.total = s.qs.length;
   setSync('saving');
   try {
-    await db.patch(`results/${s.sid}`, data);
+    await db.patch(`${PATH}/${s.sid}`, data);
     if (s.finished) { s.finishedSent = true; lsSet(LS_SESSION, s); }
     setSync('ok');
   } catch {
@@ -321,7 +347,7 @@ function startHeartbeat() {
   stopHeartbeat();
   heartbeat = setInterval(() => {
     if (!session || session.finished || document.hidden) return;
-    db.patch(`results/${session.sid}`, { updatedAt: SV, current: session.current }).catch(() => {});
+    db.patch(`${PATH}/${session.sid}`, { updatedAt: SV, current: session.current }).catch(() => {});
   }, 20000);
 }
 function stopHeartbeat() { clearInterval(heartbeat); heartbeat = null; }
@@ -394,6 +420,7 @@ function renderTest() {
   const i = s.current;
   const n = s.qs.length;
   const done = answeredCount(s);
+  saveView({ v: 'test' });
   app.className = 'sheet test';
   app.innerHTML = `
     <header class="bar">
@@ -452,6 +479,7 @@ function renderResult() {
   const score = scoreOf(s);
   const n = s.qs.length;
   const wrong = s.qs.map((_, i) => i).filter(i => s.answers[i] && !s.answers[i].ok);
+  saveView({ v: 'result' });
   app.className = 'sheet result';
   app.innerHTML = `
     <header class="result-head">
@@ -478,10 +506,8 @@ function stopTeacher() {
   teacher.stop = null;
 }
 
-async function openTeacher() {
-  let ok = false;
-  try { ok = sessionStorage.getItem('algebra_teacher') === CFG.TEACHER_HASH; } catch { /* ignore */ }
-  if (!ok) {
+async function openTeacher(restoreTo) {
+  if (!teacherAuthed()) {
     const pass = await modal.open({
       title: 'Вход для учителя',
       text: 'Введите пароль, чтобы увидеть работы учеников.',
@@ -493,11 +519,13 @@ async function openTeacher() {
     if (!pass) return;
     try { sessionStorage.setItem('algebra_teacher', CFG.TEACHER_HASH); } catch { /* ignore */ }
   }
-  teacher.view = 'list';
+  teacher.view = restoreTo && restoreTo.view === 'detail' && restoreTo.sid ? 'detail' : 'list';
+  teacher.sid = teacher.view === 'detail' ? restoreTo.sid : null;
   teacher.tree = null;
   teacher.seen = {};
   renderTeacherShell();
-  teacher.stop = db.stream('results', (tree, path) => {
+  renderTeacherBody();
+  teacher.stop = db.stream(PATH, (tree, path) => {
     const sid = path.split('/').filter(Boolean)[0];
     if (sid && teacher.tree) teacher.seen[sid] = Date.now();
     teacher.tree = {};
@@ -543,6 +571,7 @@ function renderTeacherShell() {
 
 function renderTeacherBody() {
   const body = document.getElementById('tbody');
+  saveView({ v: 'teacher', tv: teacher.view, sid: teacher.sid, filter: teacher.filter, query: teacher.query });
   if (!body || teacher.tree === null) return;
   document.getElementById('tools').hidden = teacher.view !== 'list';
   if (teacher.view === 'detail') return renderDetail(body);
@@ -618,7 +647,7 @@ app.addEventListener('click', async e => {
   switch (act) {
     case 'student': return startStudent();
     case 'resume': return resumeStudent();
-    case 'teacher': return openTeacher();
+    case 'teacher': return openTeacher(null);
     case 'home': return renderHome();
     case 'answer': return answer(+b.dataset.k);
     case 'go': return goTo(+b.dataset.i);
@@ -643,7 +672,7 @@ app.addEventListener('click', async e => {
     case 'delete': {
       const r = teacher.tree[teacher.sid];
       if (!r || !confirm(`Удалить работу «${r.name}»? Её нельзя будет восстановить.`)) return;
-      try { await db.del(`results/${teacher.sid}`); } catch { alert('Не удалось удалить: нет связи с базой.'); return; }
+      try { await db.del(`${PATH}/${teacher.sid}`); } catch { alert('Не удалось удалить: нет связи с базой.'); return; }
       teacher.view = 'list';
       return renderTeacherBody();
     }
@@ -660,5 +689,5 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && session && !session.finished && app.classList.contains('test')) sync();
 });
 
-renderHome();
+restore();
 })();

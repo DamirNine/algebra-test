@@ -14,7 +14,7 @@
    ```json
    {
      "rules": {
-       "results": {
+       "algebra-test": {
          ".read": true,
          "$sid": {
            ".write": true,
