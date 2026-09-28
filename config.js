@@ -1,7 +1,7 @@
 window.CONFIG = {
   // Адрес Firebase Realtime Database (без слеша в конце), например:
   // 'https://algebra-test-12345-default-rtdb.europe-west1.firebasedatabase.app'
-  DB_URL: '',
+  DB_URL: 'https://school-tests-747f9-default-rtdb.europe-west1.firebasedatabase.app',
 
   // Раздел внутри базы, куда пишутся работы этого теста. У другого теста в той же базе — своё имя.
   DB_PATH: 'algebra-test',
