@@ -9,6 +9,8 @@ const SHORT = { fsu: 'ФСУ', eq: 'Уравнения', ar: 'Устный сч�
 const LETTERS = ['А', 'Б', 'В', 'Г'];
 const LS_SESSION = 'algebra_session';
 const LIVE_MS = 60000;
+const VERSION = '30.09.2026';
+const LOCAL_KEY = 'algebra_local_db';
 const app = document.getElementById('app');
 
 // ───────── утилиты ─────────
@@ -114,11 +116,19 @@ function resolveSV(v) {
 const db = REMOTE ? {
   // POST с x-http-method-override — «простой» запрос без предварительного CORS-запроса,
   // а keepalive не даёт браузеру оборвать его при обновлении или закрытии страницы.
+  // Таймаут обязателен: на плохой сети запрос может повиснуть без ответа и без ошибки,
+  // и тогда вся очередь сохранений стоит. Отменяем через 12 с — sync() повторит по новому соединению.
   async write(method, path, data) {
-    const res = await fetch(`${CFG.DB_URL}/${path}.json?x-http-method-override=${method}`, {
-      method: 'POST', keepalive: true, body: data === undefined ? '' : JSON.stringify(data)
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const res = await fetch(`${CFG.DB_URL}/${path}.json?x-http-method-override=${method}`, {
+        method: 'POST', keepalive: true, signal: ctrl.signal, body: data === undefined ? '' : JSON.stringify(data)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      throw e && e.name === 'AbortError' ? new Error('база не ответила за 12 секунд') : e;
+    } finally { clearTimeout(timer); }
   },
   put(path, data) { return this.write('PUT', path, data); },
   patch(path, data) { return this.write('PATCH', path, data); },
@@ -142,7 +152,7 @@ const db = REMOTE ? {
   }
 } : {
   // Без Firebase: всё хранится в localStorage этого браузера (для пробы на одном устройстве).
-  KEY: 'algebra_local_db',
+  KEY: LOCAL_KEY,
   listeners: new Set(),
   load() { return lsGet(this.KEY) || {}; },
   save(root) { lsSet(this.KEY, root); this.listeners.forEach(fn => fn()); },
@@ -221,10 +231,41 @@ function restore() {
   route();
   const p = session || lsGet(LS_SESSION);
   if (p && needsSync(p)) sync(p);
+  uploadLocalLeftovers();
+}
+
+// Работы, сохранённые в пробном режиме (когда база ещё не была подключена или у вкладки был старый адрес),
+// отправляем в базу, как только она доступна. После успешной отправки убираем из браузера.
+function localLeftovers() {
+  const root = lsGet(LOCAL_KEY);
+  const out = [];
+  if (!root || typeof root !== 'object') return out;
+  for (const [key, group] of Object.entries(root)) {
+    if (!group || typeof group !== 'object') continue;
+    for (const [sid, rec] of Object.entries(group)) if (rec && rec.name && rec.qs) out.push({ key, sid, rec });
+  }
+  return out;
+}
+async function uploadLocalLeftovers() {
+  if (!REMOTE) return { sent: 0, failed: 0 };
+  let sent = 0, failed = 0;
+  for (const { key, sid, rec } of localLeftovers()) {
+    try {
+      await db.patch(`${PATH}/${sid}`, rec);
+      const root = lsGet(LOCAL_KEY) || {};
+      if (root[key]) delete root[key][sid];
+      if (root[key] && !Object.keys(root[key]).length) delete root[key];
+      if (Object.keys(root).length) lsSet(LOCAL_KEY, root); else lsDel(LOCAL_KEY);
+      sent++;
+    } catch { failed++; }
+  }
+  return { sent, failed };
 }
 
 function route() {
+  if (location.hash === '#check') return renderCheck();
   const v = loadView();
+  if (v.v === 'check') return renderCheck();
   const s = lsGet(LS_SESSION);
   if ((v.v === 'test' || v.v === 'result') && s) {
     if (!s.finished) return resumeStudent();
@@ -244,6 +285,7 @@ function renderHome() {
   stopTeacher();
   stopHeartbeat();
   saveView({ v: 'home' });
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
   const s = lsGet(LS_SESSION);
   const resume = s && !s.finished ? s : null;
   app.className = 'sheet home';
@@ -270,6 +312,7 @@ function renderHome() {
       </button>
     </div>
     ${REMOTE ? '' : `<p class="note-local">База данных не подключена: результаты сохраняются только в этом браузере. Инструкция по подключению — в README.</p>`}
+    <p class="home-foot"><button class="linkish" data-action="check">Проверить связь с базой</button></p>
   `;
 }
 
@@ -316,12 +359,25 @@ function resumeStudent() {
   renderTest();
 }
 
+let lastSyncError = '';
 function setSync(state) {
   syncState = state;
   const el = document.getElementById('sync');
   if (el) {
     el.dataset.state = state;
-    el.textContent = state === 'ok' ? 'Ответы сохранены' : state === 'saving' ? 'Сохраняю…' : 'Нет связи — повторю';
+    el.textContent = !REMOTE ? 'Сохранено только на этом компьютере'
+      : state === 'ok' ? 'Ответы сохранены' : state === 'saving' ? 'Сохраняю…' : 'Нет связи с базой — повторю';
+    el.title = state === 'error' ? lastSyncError : '';
+  }
+  const sent = document.getElementById('sent');
+  if (sent && session) {
+    const done = session.finishedSent && !needsSync(session);
+    sent.dataset.state = !REMOTE || (state === 'error' && !done) ? 'error' : done ? 'ok' : 'saving';
+    sent.innerHTML = !REMOTE
+      ? 'База не подключена: результат сохранён только на этом компьютере, учитель его не увидит.'
+      : done ? 'Результат отправлен учителю.'
+      : state === 'error' ? 'Результат пока <b>не дошёл</b> до учителя: нет связи с базой. Не закрывайте страницу — отправка повторяется автоматически. <button class="linkish" data-action="check">Проверить связь</button>'
+      : 'Отправляю результат учителю…';
   }
 }
 
@@ -359,11 +415,12 @@ async function sync(s = session, urgent = false) {
   let ok = true;
   try {
     await db.patch(`${PATH}/${s.sid}`, data);
+    lastSyncError = '';
     s.created = true;
     s.syncedRev = Math.max(s.syncedRev || 0, rev);
     if (finishing) s.finishedSent = true;
     persist(s);
-  } catch { ok = false; }
+  } catch (e) { ok = false; lastSyncError = String(e && e.message || e); }
   inflight--;
   if (!ok) { setSync('error'); scheduleSync(s); return; }
   if (inflight) return;
@@ -515,15 +572,153 @@ function renderResult() {
       <p class="bar-name">${esc(s.name)}</p>
       <p class="score"><span class="score-num">${score}</span> из ${n}</p>
       <p class="lead">${score === n ? 'Все задания решены верно.' :
-        `Верных ответов: ${score}. ${wrong.length ? 'Ниже — задания с ошибками и как их решать.' : ''}`}
-        Результат отправлен учителю.</p>
-      <p class="sync" id="sync" data-state="${syncState}"></p>
+        `Верных ответов: ${score}. ${wrong.length ? 'Ниже — задания с ошибками и как их решать.' : ''}`}</p>
+      <p class="sent" id="sent"></p>
     </header>
     ${navHtml(s, -1, false)}
     ${wrong.map(i => questionHtml(s, i, 'review')).join('')}
     <footer class="pager"><button class="btn ghost" data-action="home">На главную</button></footer>
   `;
   setSync(syncState);
+}
+
+// ───────── проверка связи с базой ─────────
+// Открывается кнопкой на главной или по адресу …/algebra-test/#check.
+// Показывает по шагам, где рвётся связь, и отправляет застрявшие работы.
+let checkReport = [];
+
+async function timedFetch(url, opts = {}, ms = 10000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ctrl.signal, cache: 'no-store' }); }
+  finally { clearTimeout(t); }
+}
+function netError(e) {
+  if (e && e.name === 'AbortError') return 'база не ответила за 10 секунд';
+  return `запрос не прошёл — сеть, антивирус или расширение браузера блокирует адрес базы (${e && e.message || e})`;
+}
+async function httpError(res) {
+  let text = '';
+  try { text = (await res.text()).slice(0, 120); } catch { /* ignore */ }
+  return `база ответила ошибкой HTTP ${res.status} ${text}`;
+}
+
+function pendingOnThisDevice() {
+  const list = [];
+  const s = lsGet(LS_SESSION);
+  if (s && needsSync(s)) list.push(s.name + (s.finished ? ' (сдана)' : ' (не сдана)'));
+  for (const { rec } of localLeftovers()) list.push(rec.name + (rec.finishedAt ? ' (сдана, пробный режим)' : ' (пробный режим)'));
+  return list;
+}
+
+async function renderCheck() {
+  stopTeacher();
+  stopHeartbeat();
+  saveView({ v: 'check' });
+  app.className = 'sheet check';
+  app.innerHTML = `
+    <header class="bar">
+      <div>
+        <p class="bar-name">Проверка связи с базой</p>
+        <p class="bar-meta">Если работы не доходят до учителя, откройте эту страницу на том компьютере, где решали тест.</p>
+      </div>
+    </header>
+    <ol class="checks" id="checks"></ol>
+    <div id="check-pending"></div>
+    <footer class="pager">
+      <button class="btn ghost" data-action="home">На главную</button>
+      <button class="btn ghost" data-action="check-again">Проверить ещё раз</button>
+      <button class="btn" data-action="check-copy">Скопировать отчёт</button>
+    </footer>`;
+  checkReport = [`Проверка связи, ${fmtDate(Date.now())}`];
+  const list = document.getElementById('checks');
+  const step = title => {
+    const li = document.createElement('li');
+    li.className = 'chk wait';
+    li.innerHTML = `<span class="check-title">${esc(title)}</span><span class="check-detail">Проверяю…</span>`;
+    list.appendChild(li);
+    return (ok, detail) => {
+      li.className = 'chk ' + (ok ? 'ok' : 'bad');
+      li.querySelector('.check-detail').textContent = detail;
+      checkReport.push(`${ok ? '[OK]' : '[ОШИБКА]'} ${title}: ${detail}`);
+      return ok;
+    };
+  };
+
+  step('Версия сайта')(REMOTE, `${VERSION}, ${REMOTE ? 'база подключена' : 'пробный режим: адрес базы не задан (обновите страницу)'}`);
+  step('Браузер и сеть')(navigator.onLine, `${navigator.onLine ? 'интернет есть' : 'браузер сообщает, что интернета нет'}; ${navigator.userAgent}`);
+  if (!REMOTE) return renderPending(false);
+
+  const base = `${CFG.DB_URL}/${PATH}`;
+  let readOk = false, writeOk = false;
+  const read = step('Чтение из базы');
+  try {
+    const res = await timedFetch(`${base}.json?shallow=true`);
+    if (res.ok) { const d = await res.json(); readOk = read(true, `работает, работ в базе: ${d ? Object.keys(d).length : 0}`); }
+    else read(false, await httpError(res));
+  } catch (e) { read(false, netError(e)); }
+
+  const write = step('Запись в базу');
+  const probe = `${base}/_check_${Math.random().toString(36).slice(2, 8)}.json`;
+  try {
+    const res = await timedFetch(`${probe}?x-http-method-override=PATCH`, {
+      method: 'POST', body: JSON.stringify({ name: '_check', qs: [{ id: 'f1', o: [0, 1, 2, 3] }] })
+    });
+    if (res.ok) {
+      writeOk = write(true, 'работает');
+      timedFetch(`${probe}?x-http-method-override=DELETE`, { method: 'POST', body: '' }).catch(() => {});
+    } else write(false, await httpError(res));
+  } catch (e) { write(false, netError(e)); }
+
+  const live = step('Обновление в реальном времени (кабинет учителя)');
+  await new Promise(resolve => {
+    let es;
+    const t = setTimeout(() => { es && es.close(); live(false, 'не удалось подключиться за 10 секунд — учитель увидит работы только после обновления страницы'); resolve(); }, 10000);
+    try {
+      es = new EventSource(`${base}.json?shallow=true`);
+      es.addEventListener('put', () => { clearTimeout(t); es.close(); live(true, 'работает'); resolve(); });
+    } catch (e) { clearTimeout(t); live(false, String(e)); resolve(); }
+  });
+
+  if (!readOk && !writeOk) checkReport.push('Вывод: с этого компьютера база недоступна. Попробуйте другую сеть (например, раздать интернет с телефона) или отключить антивирус/расширения для этого сайта.');
+  renderPending(writeOk);
+}
+
+function renderPending(canSend) {
+  const box = document.getElementById('check-pending');
+  if (!box) return;
+  const list = pendingOnThisDevice();
+  checkReport.push(`Неотправленных работ на этом компьютере: ${list.length}${list.length ? ' — ' + list.join(', ') : ''}`);
+  box.innerHTML = list.length ? `
+    <div class="pending">
+      <p><b>На этом компьютере есть работы, которые не дошли до учителя:</b></p>
+      <ul>${list.map(n => `<li>${esc(n)}</li>`).join('')}</ul>
+      ${canSend ? '<button class="btn" data-action="check-send">Отправить их учителю</button>'
+        : '<p class="muted">Отправить сейчас нельзя: нет связи с базой. Они отправятся сами, когда связь появится и сайт откроют на этом компьютере.</p>'}
+    </div>` : '<p class="muted pending-none">Неотправленных работ на этом компьютере нет.</p>';
+}
+
+async function checkSend(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Отправляю…';
+  const s = lsGet(LS_SESSION);
+  if (s && needsSync(s)) { if (!session || session.sid !== s.sid) session = s; await sync(session); }
+  const r = await uploadLocalLeftovers();
+  renderPending(true);
+  const box = document.getElementById('check-pending');
+  const left = pendingOnThisDevice().length;
+  box.insertAdjacentHTML('afterbegin', `<p class="${left ? 'form-error' : 'verdict ok'}">${left ? `Не удалось отправить: ${left}. Попробуйте ещё раз.` : 'Готово — все работы отправлены учителю.'}${r.sent ? ` (из пробного режима: ${r.sent})` : ''}</p>`);
+}
+
+async function checkCopy(btn) {
+  const text = checkReport.join(String.fromCharCode(10));
+  try { await navigator.clipboard.writeText(text); btn.textContent = 'Скопировано'; }
+  catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); btn.textContent = 'Скопировано'; } catch { btn.textContent = 'Не удалось скопировать'; }
+    ta.remove();
+  }
 }
 
 // ───────── учитель ─────────
@@ -678,6 +873,10 @@ app.addEventListener('click', async e => {
     case 'resume': return resumeStudent();
     case 'teacher': return openTeacher(null);
     case 'home': return renderHome();
+    case 'check': return renderCheck();
+    case 'check-again': return renderCheck();
+    case 'check-send': return checkSend(b);
+    case 'check-copy': return checkCopy(b);
     case 'answer': return answer(+b.dataset.k);
     case 'go': return goTo(+b.dataset.i);
     case 'prev': return goTo(session.current - 1);
