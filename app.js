@@ -325,6 +325,19 @@ let syncState = 'ok';
 function answeredCount(s) { return Object.keys(s.answers || {}).length; }
 function scoreOf(s) { return Object.values(s.answers || {}).filter(a => a && a.ok).length; }
 
+// Неотправленную работу предыдущего ученика не затираем, а кладём в очередь на отправку
+function stashForUpload(s) {
+  const root = lsGet(LOCAL_KEY) || {};
+  root.outbox = root.outbox || {};
+  root.outbox[s.sid] = {
+    name: s.name, qs: s.qs, answers: s.answers, current: s.current,
+    score: scoreOf(s), answered: answeredCount(s), total: s.qs.length,
+    startedAt: s.startedLocal, updatedAt: Date.now(),
+    ...(s.finished ? { finishedAt: s.finishedLocal || Date.now() } : {})
+  };
+  lsSet(LOCAL_KEY, root);
+}
+
 async function startStudent() {
   const s = lsGet(LS_SESSION);
   if (s && !s.finished && !confirm(`Есть незаконченный тест (${s.name}). Начать новый? Старая попытка останется у учителя незавершённой.`)) return;
@@ -341,6 +354,7 @@ async function startStudent() {
     shuffle(BANK.filter(q => q.s === sec)).slice(0, CFG.PER_SECTION)
       .forEach(q => qs.push({ id: q.id, o: shuffle([0, 1, 2, 3]) }));
   }
+  if (s && REMOTE && needsSync(s)) { stashForUpload(s); uploadLocalLeftovers(); }
   session = {
     sid: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
     name, qs, answers: {}, current: 0, finished: false, startedLocal: Date.now(), rev: 1, syncedRev: 0
@@ -607,7 +621,10 @@ function pendingOnThisDevice() {
   const list = [];
   const s = lsGet(LS_SESSION);
   if (s && needsSync(s)) list.push(s.name + (s.finished ? ' (сдана)' : ' (не сдана)'));
-  for (const { rec } of localLeftovers()) list.push(rec.name + (rec.finishedAt ? ' (сдана, пробный режим)' : ' (пробный режим)'));
+  for (const { key, rec } of localLeftovers()) {
+    const how = key === 'outbox' ? 'не отправилась' : 'пробный режим';
+    list.push(`${rec.name} (${rec.finishedAt ? 'сдана, ' : ''}${how})`);
+  }
   return list;
 }
 
